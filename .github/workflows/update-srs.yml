@@ -36,11 +36,17 @@ jobs:
           git push
 
       - name: Уведомление в Telegram (опционально)
-        if: steps.changes.outputs.changed == 'true' && secrets.TELEGRAM_BOT_TOKEN != ''
+        if: steps.changes.outputs.changed == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          # Проверяем, заданы ли секреты. Если нет — просто пропускаем шаг без ошибки.
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "ℹ️ Секреты Telegram не заданы, пропускаем уведомление."
+            exit 0
+          fi
+          
           MESSAGE="🔔 *Обновлён список russia-mobile-whitelist*%0A%0A📁 \`russia-mobile-whitelist.lst\`%0A📦 \`russia-mobile-whitelist.srs\`%0A🔗 [Смотреть файлы](https://github.com/${{ github.repository }})%0A📦 [Коммит](https://github.com/${{ github.repository }}/commit/${{ github.sha }})"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
