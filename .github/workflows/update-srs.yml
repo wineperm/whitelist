@@ -3,6 +3,12 @@ name: Update Russia Mobile Whitelist SRS
 on:
   schedule:
     - cron: '0 3 * * *'          # Каждый день в 3:00 UTC
+  push:
+    branches:
+      - main
+    paths:
+      - 'custom_allow.lst'       # Триггер при изменении ваших правил
+      - 'custom_deny.lst'
   workflow_dispatch:             # Возможность ручного запуска
 
 permissions:
@@ -16,10 +22,85 @@ jobs:
       - name: Checkout репозитория
         uses: actions/checkout@v4
 
-      - name: Запуск скрипта генерации SRS
+      - name: Скачивание и очистка исходного списка
         run: |
-          chmod +x scripts/generate_srs.sh
-          ./scripts/generate_srs.sh
+          SOURCE_URL="https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/whitelist.txt"
+          echo "📥 Скачивание исходного списка..."
+          curl -sL "$SOURCE_URL" -o russia-mobile-whitelist.lst
+
+          echo "🧹 Очистка списка от мусора..."
+          sed -i '1s/^\xEF\xBB\xBF//' russia-mobile-whitelist.lst 2>/dev/null || true
+          sed -i '/^$/d' russia-mobile-whitelist.lst
+          sed -i 's/^[ \t]*//; s/[ \t]*$//' russia-mobile-whitelist.lst
+          sed -i '/^#/d' russia-mobile-whitelist.lst
+
+          if [ ! -s russia-mobile-whitelist.lst ]; then
+            echo "❌ Ошибка: список пуст после очистки"
+            exit 1
+          fi
+          echo "✅ Очищенный список сохранен"
+
+      - name: Применение пользовательских правил и компиляция SRS
+        run: |
+          # Создаём финальный список на основе скачанного .lst
+          cp russia-mobile-whitelist.lst final.lst
+
+          # --- Удаляем домены из custom_deny.lst (если существует) ---
+          if [ -f custom_deny.lst ]; then
+            echo "🚫 Применение custom_deny.lst..."
+            sed -i 's/^[ \t]*//; s/[ \t]*$//' custom_deny.lst
+            sed -i '/^$/d' custom_deny.lst
+            sed -i '/^#/d' custom_deny.lst
+            
+            # Безопасно удаляем точные совпадения строк (grep -vxF надежнее sed с точками в доменах)
+            while IFS= read -r deny_domain; do
+              if [ -n "$deny_domain" ]; then
+                grep -vxF "$deny_domain" final.lst > temp.lst || true
+                mv temp.lst final.lst
+              fi
+            done < custom_deny.lst
+          fi
+
+          # --- Добавляем домены из custom_allow.lst (если существует) ---
+          if [ -f custom_allow.lst ]; then
+            echo "✅ Применение custom_allow.lst..."
+            sed -i 's/^[ \t]*//; s/[ \t]*$//' custom_allow.lst
+            sed -i '/^$/d' custom_allow.lst
+            sed -i '/^#/d' custom_allow.lst
+            
+            while IFS= read -r allow_domain; do
+              if [ -n "$allow_domain" ] && ! grep -qxF "$allow_domain" final.lst; then
+                echo "$allow_domain" >> final.lst
+              fi
+            done < custom_allow.lst
+          fi
+
+          # --- Формируем JSON для sing-box ---
+          if [ ! -s final.lst ]; then
+            echo "⚠️ Предупреждение: финальный список пуст"
+            echo '{"version": 3, "rules": []}' > rules.json
+          else
+            echo "🛠 Формирование JSON для sing-box..."
+            echo '{"version": 3, "rules": [{"domain_suffix": [' > rules.json
+            sed 's/^/"/; s/$/"/' final.lst | paste -sd ',' >> rules.json
+            echo ']}]}' >> rules.json
+          fi
+
+          # --- Компилируем SRS через Docker ---
+          echo "⚙️ Компиляция в формат .srs через Docker..."
+          docker run --rm -v "${GITHUB_WORKSPACE}:/data" ghcr.io/sagernet/sing-box:latest \
+            rule-set compile --output /data/russia-mobile-whitelist.srs /data/rules.json
+
+          if [ -f russia-mobile-whitelist.srs ]; then
+            echo "✅ SRS файл создан успешно"
+            ls -la russia-mobile-whitelist.srs
+          else
+            echo "❌ Ошибка: SRS файл не был создан"
+            exit 1
+          fi
+
+          # Удаляем временные файлы
+          rm -f rules.json final.lst
 
       - name: Проверка изменений
         id: changes
@@ -35,18 +116,16 @@ jobs:
           git commit -m "Автообновление: russia-mobile-whitelist [skip ci]"
           git push
 
-      - name: Уведомление в Telegram (опционально)
+      - name: Уведомление в Telegram
         if: steps.changes.outputs.changed == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Проверяем, заданы ли секреты. Если нет — просто пропускаем шаг без ошибки.
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
             echo "ℹ️ Секреты Telegram не заданы, пропускаем уведомление."
             exit 0
           fi
-          
           MESSAGE="🔔 *Обновлён список russia-mobile-whitelist*%0A%0A📁 \`russia-mobile-whitelist.lst\`%0A📦 \`russia-mobile-whitelist.srs\`%0A🔗 [Смотреть файлы](https://github.com/${{ github.repository }})%0A📦 [Коммит](https://github.com/${{ github.repository }}/commit/${{ github.sha }})"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
